@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Env / secrets
+.env
+*.local
+
+# Data dumps (keep small sample only)
+data/
+*.json.gz
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Node (frontend, added later)
+node_modules/
+dist/
