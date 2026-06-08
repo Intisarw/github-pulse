@@ -1,6 +1,6 @@
 # GitHub Pulse
 
-![CI](https://github.com/OWNER/github-pulse/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/Intisarw/github-pulse/actions/workflows/ci.yml/badge.svg)
 
 **Status:** In active development
 
