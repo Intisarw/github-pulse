@@ -2,30 +2,55 @@
 
 ![CI](https://github.com/Intisarw/github-pulse/actions/workflows/ci.yml/badge.svg)
 
-**Status:** In active development
+A write-heavy analytics platform for the GitHub public events stream. It polls
+events at high volume, stores them in a day-partitioned Postgres schema with
+idempotent batch writes, pre-aggregates them into per-minute rollups, and
+serves the read path from those rollups through a pooled FastAPI layer.
 
-A write-heavy analytics platform for the GitHub public events stream. It ingests
-events at high volume, stores them in a partitioned Postgres schema, pre-aggregates
-them into rollups, and serves sub-second analytics to a live dashboard.
-
-This is a **learning project built to scale**: the goal is to hit real
-database-scaling problems — partitioning, indexing trade-offs, write throughput,
-rollups vs raw scans — and document the decisions with measured numbers. See
-[`DESIGN.md`](DESIGN.md) for the decision log and [`LEARNING.md`](LEARNING.md) for
-the build plan.
+The design goal: keep accepting writes as volume grows, and know — with a
+measured number, not a guess — where each bottleneck is. The decision log in
+[`DESIGN.md`](DESIGN.md) records every trade-off and what it cost.
 
 > Reality note: GitHub has no push "firehose". The public
 > [`/events`](https://api.github.com/events) endpoint is *polled* (~300 events/page,
-> rate-limited, overlapping pages → dedup required). For load testing past the rate
-> limit, use the synthetic generator in `loadtest/`.
+> rate-limited, overlapping pages → dedup required). The poller is ETag-aware, so
+> unchanged polls cost no rate-limit points. For load past the rate limit, use the
+> synthetic generator in `loadtest/`.
 
-## Results (fill in as you measure)
+## Measured results
 
-| Metric                        | Result                |
-|-------------------------------|-----------------------|
-| Sustained write throughput    | _TBD_ events/sec      |
-| Read p95 (trending repos)     | _TBD_ ms              |
-| Breaking point + root cause   | _TBD_                 |
+Environment: 4-core arm64 Linux, 4 GB RAM, Postgres 18 — single node, ingester
+and DB co-located. Reproduce with `make bench` and `make loadtest`.
+
+**Write path** (50k synthetic events, single connection):
+
+| Strategy                     | Throughput      | vs. worst |
+|------------------------------|-----------------|-----------|
+| commit-per-row               |   ~3,400 rows/s | 1x        |
+| executemany, batch=500       |  ~43,000 rows/s | 13x       |
+| COPY + staging, batch=500    |  ~62,000 rows/s | 18x       |
+| COPY + staging, batch=5000   |  ~81,000 rows/s | 24x       |
+
+**Index trade-offs** (the part nobody tells you):
+
+- The two secondary indexes the ad-hoc queries need cut COPY ingest from
+  ~154k to ~84k rows/s (**-46%** write throughput on a fresh partition).
+- In exchange, "events for actor X, last hour" went from a 75.3 ms parallel
+  seq scan to a 0.21 ms index scan (**366x**) on 300k rows.
+
+**Read path** (rollup-backed API, 300k events / 60k rollup rows in window):
+
+| Concurrency | Throughput | p50    | p95    |
+|-------------|------------|--------|--------|
+| 4           |   76 req/s |  56 ms |  60 ms |
+| 16          |  309 req/s |  54 ms |  59 ms |
+| 50          |  369 req/s | 141 ms | 182 ms |
+
+Connect-per-request capped the API at 266 req/s with p95 279 ms at
+concurrency 50; switching to a connection pool gave +39% throughput and
+-35% p95. At 50 concurrent the bottleneck is now the aggregation query
+itself (CPU-bound), not connections — the next lever is a coarser rollup
+grain, not a cache (see DESIGN.md D6).
 
 ## Architecture
 
@@ -35,18 +60,24 @@ the build plan.
                                                                ▼
                                                     PostgreSQL (partitioned by day)
                                                      ├─ events        (raw, append-only)
-                                                     └─ rollup_*       (pre-aggregated)
+                                                     └─ rollup_*      (per-minute aggregates)
                                                                │  reads rollups only
                                                                ▼
-                                                       FastAPI query layer
-                                                               │  (+ Redis cache, when measured-needed)
-                                                               ▼
-                                                    Vite + React dashboard
+                                                  FastAPI query layer (pooled)
 ```
 
-**Stretch goal:** a C++ aggregator (Count-Min Sketch for top-K, HyperLogLog for
-unique users) callable from Python via pybind11. Intentionally *not* load-bearing
-— v1 aggregates in SQL. See `DESIGN.md` D7.
+Key properties, each verified by an integration test:
+
+- **Idempotent ingest** — dedup lives in the DB (`ON CONFLICT (id, created_at)
+  DO NOTHING`), so restarts and multiple ingester replicas are safe. Both write
+  paths (executemany and COPY-via-staging) share this guarantee.
+- **Partitioned storage** — one partition per UTC day. Retention is
+  `DROP TABLE` (instant, no bloat) instead of `DELETE`; time-bounded queries
+  prune to the partitions they touch.
+- **Rollups, not raw scans** — the API never reads `events`. Rollup refresh is
+  an idempotent windowed upsert: re-running converges, and late-arriving
+  events inside the window are absorbed (chosen over a materialized view —
+  DESIGN.md D3).
 
 ## Quickstart
 
@@ -59,28 +90,28 @@ pip install -e ".[dev]"
 
 # 3. Run the ingester (set GITHUB_TOKEN to get 5000 req/hr instead of 60)
 export GITHUB_TOKEN=ghp_xxx
-make ingest
+make ingest        # terminal 1: poll events into Postgres
+make rollup        # terminal 2: refresh rollups every 15s
+make api           # terminal 3: http://localhost:8000/docs
 
-# 4. Serve the query API
-make api          # http://localhost:8000/health
-
-# 5. Tests / lint / load test
-make test
+# 4. Tests / lint / benchmarks
+make test          # unit tests; set DATABASE_URL to include integration tests
 make lint
-make loadtest     # needs the API running
+make bench         # write-path benchmark
+make loadtest      # read-path load test (needs API running)
 ```
 
 ## Repo layout
 
 ```
-db/schema.sql            partitioned events table + rollups (with guided TODOs)
-ingestor/                firehose poller, batch writer, config
-api/main.py              read-path query API (reads rollups)
-loadtest/                synthetic event generator + Locust read-path test
-tests/                   unit tests (green) + integration TODOs
-DESIGN.md                decision log — the most interview-relevant file
-LEARNING.md              week-by-week plan + concept map + question bank
-NOTES.md                 measurement log / lab notebook
+db/schema.sql            partitioned events table, rollups, refresh function
+ingestor/firehose.py     ETag-aware poller
+ingestor/writer.py       batch writer: executemany + COPY paths
+ingestor/rollup.py       rollup refresh loop
+api/main.py              read-path API (rollups only, pooled connections)
+loadtest/                synthetic generator, write benchmark, Locust read test
+tests/                   unit + DB integration tests (idempotency, rollup correctness)
+DESIGN.md                decision log: what was chosen, what it cost, what was rejected
 ```
 
 ## License
