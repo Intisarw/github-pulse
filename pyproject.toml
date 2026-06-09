@@ -20,6 +20,11 @@ dev = [
     "locust>=2.25",
 ]
 
+[tool.setuptools]
+# Flat layout with several top-level dirs (db/, loadtest/, tests/); only these
+# two are installable packages, so spell them out for setuptools discovery.
+packages = ["ingestor", "api"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
