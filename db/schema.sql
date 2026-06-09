@@ -1,26 +1,24 @@
 -- =============================================================================
 -- GitHub Pulse — database schema
 -- =============================================================================
--- This file is loaded automatically when the Postgres container first starts.
---
--- LEARNING NOTE: This schema is intentionally a STARTING POINT, not a finished
--- design. The TODOs are the parts where the real database-scaling lessons live.
--- Do them yourself, measure the effect, and write what you learned in NOTES.md.
+-- Loaded automatically when the Postgres container first starts
+-- (mounted into /docker-entrypoint-initdb.d by docker-compose.yml).
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
--- 1. RAW EVENTS  (the write-heavy, append-only table)
+-- 1. RAW EVENTS  (write-heavy, append-only)
 -- -----------------------------------------------------------------------------
--- This is where the firehose lands. It is append-only and grows fast, so it is
--- the table that teaches you partitioning, indexing trade-offs, and write
--- throughput.
+-- Partitioned BY RANGE on created_at (time), because:
+--   - Events arrive in time order, so writes always hit the newest partition,
+--     which keeps that partition's indexes hot in cache.
+--   - Retention is a metadata operation: DETACH/DROP a whole day instead of a
+--     slow DELETE that bloats the table and forces a vacuum.
+--   - Dashboard queries are time-bounded ("last 60 minutes"), so the planner
+--     prunes every partition outside the window before touching disk.
 --
--- We partition BY RANGE on created_at (time). Why time?
---   - Events arrive in time order, so writes hit the newest partition (hot).
---   - Old data can be dropped by DETACHing a whole partition (instant) instead
---     of a slow DELETE that bloats the table.
---   - Queries are almost always time-bounded ("last 24h"), so the planner can
---     skip (prune) partitions it doesn't need.
+-- Partitioning by repo was rejected: writes would scatter across all
+-- partitions (no locality), retention would still require DELETEs, and the
+-- hot-repo skew would make partitions wildly uneven. See DESIGN.md D2.
 
 CREATE TABLE IF NOT EXISTS events (
     id          BIGINT       NOT NULL,
@@ -29,32 +27,53 @@ CREATE TABLE IF NOT EXISTS events (
     repo        TEXT         NOT NULL,   -- "owner/name"
     created_at  TIMESTAMPTZ  NOT NULL,
     ingested_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    -- Note: PRIMARY KEY on a partitioned table MUST include the partition key.
-    -- This is a real constraint that surprises people — write it in NOTES.md.
+    -- A PRIMARY KEY on a partitioned table MUST include the partition key:
+    -- uniqueness is enforced per-partition, so the key has to determine which
+    -- partition a row lives in.
     PRIMARY KEY (id, created_at)
 ) PARTITION BY RANGE (created_at);
 
--- One partition per day. In production you'd automate this (pg_partman or a
--- cron job). For now, create a few by hand so you understand what's happening.
-CREATE TABLE IF NOT EXISTS events_2026_06_06 PARTITION OF events
-    FOR VALUES FROM ('2026-06-06') TO ('2026-06-07');
-CREATE TABLE IF NOT EXISTS events_2026_06_07 PARTITION OF events
-    FOR VALUES FROM ('2026-06-07') TO ('2026-06-08');
+-- Partition management: one partition per UTC day. ensure_events_partition()
+-- is idempotent; init covers yesterday..+7 days, and a daily cron (or
+-- pg_partman in production) keeps the window rolling.
+CREATE OR REPLACE FUNCTION ensure_events_partition(day date)
+RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS %I PARTITION OF events
+             FOR VALUES FROM (%L) TO (%L)',
+        'events_' || to_char(day, 'YYYY_MM_DD'), day, day + 1
+    );
+END $$;
 
--- TODO (indexing exercise):
---   The dashboard asks "top repos in the last hour" and "events for actor X".
---   Add the indexes you think those queries need. Then EXPLAIN ANALYZE the
---   queries BEFORE and AFTER and record the row counts / timings in NOTES.md.
---   Question to answer: why might an index HURT your ingest throughput?
--- CREATE INDEX ... ;
+DO $$
+DECLARE d date;
+BEGIN
+    FOR d IN SELECT generate_series(current_date - 1, current_date + 7, '1 day')::date
+    LOOP
+        PERFORM ensure_events_partition(d);
+    END LOOP;
+END $$;
+
+-- Indexes for the ad-hoc queries the rollups don't cover ("events for actor X",
+-- "activity for repo Y"). These are partitioned indexes — each daily partition
+-- gets its own small B-tree, which stays cache-resident for the hot partition.
+--
+-- Trade-off (measured, see DESIGN.md §2): every index is extra work per row
+-- inserted. With these two indexes, COPY throughput dropped from ~154k to
+-- ~84k rows/s (-46%) on a fresh partition. Worth it for read paths we
+-- actually have; anything speculative is not.
+CREATE INDEX IF NOT EXISTS events_repo_created_idx  ON events (repo,  created_at);
+CREATE INDEX IF NOT EXISTS events_actor_created_idx ON events (actor, created_at);
 
 
 -- -----------------------------------------------------------------------------
--- 2. ROLLUPS  (the read-fast, pre-aggregated tables)
+-- 2. ROLLUPS  (read-fast, pre-aggregated)
 -- -----------------------------------------------------------------------------
--- Querying raw events for every dashboard refresh does not scale. The standard
--- fix is to pre-aggregate into small "rollup" tables on a fixed time grain.
--- The dashboard reads these instead of the firehose.
+-- The dashboard never scans raw events; it reads these per-minute aggregates.
+-- Both tables are tiny relative to `events` (bounded by distinct values per
+-- minute, not by event volume).
 
 -- Per-minute counts of each event type.
 CREATE TABLE IF NOT EXISTS rollup_event_type_1m (
@@ -72,20 +91,46 @@ CREATE TABLE IF NOT EXISTS rollup_repo_1m (
     PRIMARY KEY (bucket, repo)
 );
 
--- TODO (rollup exercise):
---   Write the SQL that rolls raw events into these tables. Two approaches:
---     (a) INSERT ... SELECT date_trunc('minute', created_at), count(*) ...
---         ON CONFLICT (...) DO UPDATE SET n = ...   <- idempotent upsert
---     (b) A materialized view you REFRESH on a schedule.
---   Try both. Which is idempotent if you run it twice? Which handles late data?
---   Put the answer in NOTES.md — this is a classic interview question.
+-- Incremental rollup via idempotent upsert.
+--
+-- Chosen over a materialized view because:
+--   - Idempotent: recomputes the window from raw events and overwrites, so
+--     running it twice (or after a crash) converges to the same state.
+--   - Handles late-arriving data: any event that lands inside the recompute
+--     window is picked up on the next run; a matview would need a full REFRESH.
+--   - Incremental: touches only the window, not the whole history. REFRESH
+--     MATERIALIZED VIEW recomputes everything, which stops being viable fast.
+--
+-- Call with a window that generously covers ingest lag, e.g. every 15s with
+-- win_start = now() - interval '5 minutes'.
+CREATE OR REPLACE FUNCTION refresh_rollups(win_start timestamptz, win_end timestamptz)
+RETURNS void
+LANGUAGE sql AS $$
+    INSERT INTO rollup_event_type_1m (bucket, event_type, n)
+    SELECT date_trunc('minute', created_at), event_type, count(*)
+    FROM events
+    WHERE created_at >= win_start AND created_at < win_end
+    GROUP BY 1, 2
+    ON CONFLICT (bucket, event_type) DO UPDATE SET n = EXCLUDED.n;
+
+    INSERT INTO rollup_repo_1m (bucket, repo, n)
+    SELECT date_trunc('minute', created_at), repo, count(*)
+    FROM events
+    WHERE created_at >= win_start AND created_at < win_end
+    GROUP BY 1, 2
+    ON CONFLICT (bucket, repo) DO UPDATE SET n = EXCLUDED.n;
+$$;
 
 
 -- -----------------------------------------------------------------------------
--- 3. INGEST BOOKKEEPING (idempotency / dedup)
+-- 3. IDEMPOTENCY / DEDUP
 -- -----------------------------------------------------------------------------
--- The Events API returns overlapping pages, so you WILL see the same event id
--- twice. Your pipeline must be idempotent. The events PK (id, created_at)
--- already lets you use INSERT ... ON CONFLICT DO NOTHING — but think about
--- whether that's enough, and why a dedup based purely on id could be wrong
--- across day boundaries. Notes go in NOTES.md.
+-- The Events API returns overlapping pages, so the same event id WILL arrive
+-- more than once. Dedup lives in the database — INSERT ... ON CONFLICT
+-- (id, created_at) DO NOTHING — not in application memory, because:
+--   - it survives ingester restarts (an in-memory set does not), and
+--   - it stays correct when multiple ingester replicas write concurrently.
+-- Caveat: the PK is (id, created_at), so dedup is scoped per partition key
+-- value. GitHub event ids are globally unique with a fixed created_at, so a
+-- duplicate always carries the same (id, created_at) pair and lands on the
+-- same conflict target.

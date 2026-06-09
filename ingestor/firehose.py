@@ -1,14 +1,14 @@
 """
-Poll the GitHub public events 'firehose' and hand batches to the writer.
+Poll the GitHub public events "firehose" and hand batches to the writer.
 
-REALITY CHECK (write this in your own words in NOTES.md):
-  GitHub has no push firehose. /events is POLLED. It returns ~300 recent public
-  events per page, is rate-limited, and pages overlap — so dedup is mandatory.
-  https://api.github.com/events  (public, all repos)
+Reality check: GitHub has no push firehose. /events is POLLED. It returns
+~300 recent public events per page, is rate-limited, and consecutive pages
+overlap — so dedup is mandatory (it lives in the DB, not here).
+https://api.github.com/events
 
-This file gives you the polling loop. The two hard, educational pieces are left
-as TODOs: ETag handling (don't pay for data that hasn't changed) and wiring the
-batch writer.
+Efficiency: we send If-None-Match with the last ETag. When nothing changed,
+GitHub answers 304 Not Modified, which costs no rate-limit point and no
+bandwidth. We also honor the X-Poll-Interval header GitHub returns.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import time
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from . import config
+from . import config, writer
 
 EVENTS_URL = "https://api.github.com/events"
 
@@ -29,10 +29,8 @@ def _headers(etag: str | None) -> dict[str, str]:
     }
     if config.GITHUB_TOKEN:
         h["Authorization"] = f"Bearer {config.GITHUB_TOKEN}"
-    # TODO (efficiency exercise): if etag is set, send "If-None-Match": etag.
-    #   GitHub then returns 304 Not Modified (which does NOT cost a rate-limit
-    #   point) when nothing changed. Measure how many requests this saves over
-    #   5 minutes and record it in NOTES.md.
+    if etag:
+        h["If-None-Match"] = etag
     return h
 
 
@@ -40,7 +38,8 @@ def _headers(etag: str | None) -> dict[str, str]:
 def fetch_page(client: httpx.Client, etag: str | None) -> httpx.Response:
     """One HTTP call, with exponential-backoff retries on transient failures."""
     resp = client.get(EVENTS_URL, headers=_headers(etag), timeout=10.0)
-    resp.raise_for_status()
+    if resp.status_code != 304:  # 304 Not Modified is a success, not an error
+        resp.raise_for_status()
     return resp
 
 
@@ -55,30 +54,45 @@ def normalize(raw: dict) -> dict:
     }
 
 
+def _chunks(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def poll_once(client: httpx.Client, conn, etag: str | None) -> tuple[str | None, int, float]:
+    """One poll cycle. Returns (new_etag, rows_written, seconds_to_sleep).
+
+    Dedup is NOT done here. The events PK + ON CONFLICT DO NOTHING makes
+    writes idempotent in the database, which survives restarts and stays
+    correct when several ingester replicas run at once — an in-memory
+    seen-ids set does neither.
+    """
+    resp = fetch_page(client, etag)
+
+    if resp.status_code == 304:  # nothing changed; costs no rate-limit point
+        wrote = 0
+    else:
+        etag = resp.headers.get("ETag")
+        events = [normalize(e) for e in resp.json()]
+        wrote = sum(
+            writer.write_batch(chunk, conn=conn)
+            for chunk in _chunks(events, config.BATCH_SIZE)
+        )
+
+    remaining = resp.headers.get("X-RateLimit-Remaining")
+    print(f"status={resp.status_code} wrote={wrote} rate_remaining={remaining}")
+
+    # GitHub tells us how often we're allowed to poll.
+    interval = float(resp.headers.get("X-Poll-Interval", config.POLL_INTERVAL_SECONDS))
+    return etag, wrote, max(interval, config.POLL_INTERVAL_SECONDS)
+
+
 def run() -> None:
     etag: str | None = None
-    seen_ids: set[int] = set()  # naive in-memory dedup; see TODO below
-    with httpx.Client() as client:
+    with httpx.Client() as client, writer._connect() as conn:
         while True:
-            resp = fetch_page(client, etag)
-            etag = resp.headers.get("ETag")
-
-            events = [normalize(e) for e in resp.json()]
-            fresh = [e for e in events if e["id"] not in seen_ids]
-            seen_ids.update(e["id"] for e in fresh)
-
-            # TODO (durability exercise): an in-memory set grows forever and is
-            #   lost on restart. Replace it with DB-level idempotency:
-            #   INSERT ... ON CONFLICT (id, created_at) DO NOTHING.
-            #   Then delete seen_ids entirely. Why is the DB the right place for
-            #   this in a system that might run many ingester replicas?
-
-            # TODO (writer exercise): hand `fresh` to ingestor.writer.write_batch
-            #   in chunks of config.BATCH_SIZE. Measure rows/sec with batching
-            #   vs one INSERT per row. The gap is the whole point — log it.
-            print(f"fetched={len(events)} fresh={len(fresh)} etag={etag}")
-
-            time.sleep(config.POLL_INTERVAL_SECONDS)
+            etag, _, sleep_s = poll_once(client, conn, etag)
+            time.sleep(sleep_s)
 
 
 if __name__ == "__main__":
