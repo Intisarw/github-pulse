@@ -1,12 +1,13 @@
 [project]
 name = "github-pulse"
 version = "0.1.0"
-description = "A write-heavy GitHub events analytics platform — a learning project for database scaling."
+description = "Write-heavy analytics for the GitHub public events stream: partitioned Postgres, idempotent batch ingest, rollup-backed API."
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
     "tenacity>=8.2",
     "psycopg[binary]>=3.1",
+    "psycopg-pool>=3.2",
     "fastapi>=0.110",
     "uvicorn>=0.29",
 ]
