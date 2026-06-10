@@ -326,20 +326,7 @@ DESIGN.md
 
 Documents the major design decisions, measured costs, rejected alternatives, and possible next steps.
 
-## What This Project Demonstrates
 
-GitHub Pulse is intended to demonstrate practical backend and data-engineering concepts, including:
-
-* High-throughput batch ingestion
-* Idempotent database writes
-* PostgreSQL table partitioning
-* `COPY`-based bulk loading
-* Index read/write trade-offs
-* Incremental data aggregation
-* Connection pooling
-* API load testing
-* Bottleneck identification through measurement
-* Architecture decision documentation
 
 ## License
 
